@@ -1,9 +1,9 @@
 // Vercel serverless function: keeps the Gemini API key on the server.
 // The browser app runs the tool loop; this endpoint only forwards one generateContent call.
-// If Google is busy (429/500/503) it waits briefly, retries, then tries a lighter model.
+// If a model is busy (429/5xx) or retired (404), it tries the next model in the list.
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const FALLBACKS = (process.env.GEMINI_FALLBACKS || 'gemini-2.5-flash-lite,gemini-2.0-flash').split(',').map(s => s.trim()).filter(Boolean);
-const BUSY = [429, 500, 502, 503, 504];
+const FALLBACKS = (process.env.GEMINI_FALLBACKS || 'gemini-3.8-flash,gemini-2.5-flash-lite').split(',').map(s => s.trim()).filter(Boolean);
+const RETRY = [404, 429, 500, 502, 503, 504];
 const wait = ms => new Promise(r => setTimeout(r, ms));
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
@@ -16,16 +16,19 @@ module.exports = async (req, res) => {
   if (!body || !Array.isArray(body.contents)) return res.status(400).json({ error: 'contents[] required' });
   const payload = JSON.stringify({ systemInstruction: body.systemInstruction, contents: body.contents, tools: body.tools });
   if (payload.length > 600000) return res.status(413).json({ error: 'request too large' });
-  const attempts = [MODEL, MODEL].concat(FALLBACKS.filter(m => m !== MODEL));
-  let last = { status: 502, text: JSON.stringify({ error: { message: 'no response from Gemini' } }) };
+  const models = [MODEL].concat(FALLBACKS.filter(m => m !== MODEL));
+  const attempts = models.concat([MODEL]); // one last retry of the main model
+  let best = null; // most useful failure to report (a busy error beats "model not found")
   for (let i = 0; i < attempts.length; i++) {
     try {
       const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(attempts[i]) + ':generateContent', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: payload });
-      last = { status: r.status, text: await r.text() };
-      if (r.ok) break;
-      if (!BUSY.includes(r.status) && r.status !== 404) break;
-    } catch (e) { last = { status: 502, text: JSON.stringify({ error: { message: 'upstream failure: ' + (e && e.message) } }) }; }
-    if (i < attempts.length - 1) await wait(700);
+      const text = await r.text();
+      if (r.ok) return res.status(200).setHeader('Content-Type', 'application/json').send(text);
+      if (!best || (best.status === 404 && r.status !== 404)) best = { status: r.status, text };
+      if (!RETRY.includes(r.status)) break;
+    } catch (e) { if (!best) best = { status: 502, text: JSON.stringify({ error: { message: 'upstream failure: ' + (e && e.message) } }) }; }
+    if (i < attempts.length - 1) await wait(i < 2 ? 600 : 1500);
   }
-  res.status(last.status).setHeader('Content-Type', 'application/json').send(last.text);
+  best = best || { status: 502, text: JSON.stringify({ error: { message: 'no response from Gemini' } }) };
+  res.status(best.status).setHeader('Content-Type', 'application/json').send(best.text);
 };
